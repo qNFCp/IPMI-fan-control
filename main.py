@@ -15,12 +15,15 @@ IPMI 风扇自动调速脚本
 - 退出时可选择恢复自动模式（需取消代码中注释）。
 """
 
+import os
 import subprocess
 import time
 import re
+import logging
 from typing import List
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
+from logging.handlers import TimedRotatingFileHandler
 
 # ---------------- 基本用户配置区域 ----------------
 IPMI_HOST = "192.168.1.100"      # BMC / IPMI 地址
@@ -30,14 +33,16 @@ INTERVAL_SECONDS = 30            # 轮询间隔秒
 IPMITOOL_CMD = "ipmitool"        # 若已在 PATH 中可直接用 ipmitool
 # --------------------------------------------------
 
-# ----------- 温度, 风扇转速百分比策略 ---------------
+# ------------- 温度, 风扇转速百分比策略 -------------
 # (温度下限, 风扇百分比) 规则从高到低判断
 TEMP_SPEED_RULES = [
     (70, 40),
+    (65, 35),
     (60, 30),
+    (50, 24),
     (40, 20),
     (30, 15),
-    (-273, 5),  # 最低风扇转速百分比
+    (-273, 5),  # 最低转速百分比
 ]
 MIN_PERCENT = 0
 MAX_PERCENT = 100
@@ -54,6 +59,62 @@ NIGHT_END = "07:30"
 NIGHT_MAX_PERCENT = 25
 # --------------------------------------------------
 
+# ---------------- 日志配置参数 --------------------
+LOG_DIR = "logs"
+LOG_FILE_BASENAME = "ipmi-fan.log"
+LOG_LEVEL = logging.INFO  # 如需更详细调试改为 logging.DEBUG
+LOG_BACKUP_DAYS = 30      # 日志保存多少天
+LOG_USE_UTC = False       # True 表示按 UTC 午夜切割
+# --------------------------------------------------
+
+
+# 全局 logger
+logger = logging.getLogger("ipmi_fan")
+
+
+def setup_logging():
+    """
+    配置日志系统：控制台 + 每日切割文件。
+    """
+    if not os.path.isdir(LOG_DIR):
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+    logger.setLevel(LOG_LEVEL)
+
+    # 日志格式
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] pid=%(process)d tid=%(threadName)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 控制台 Handler
+    sh = logging.StreamHandler()
+    sh.setLevel(LOG_LEVEL)
+    sh.setFormatter(fmt)
+
+    # 文件轮转 Handler
+    log_path = os.path.join(LOG_DIR, LOG_FILE_BASENAME)
+    fh = TimedRotatingFileHandler(
+        filename=log_path,
+        when='midnight',
+        interval=1,
+        backupCount=LOG_BACKUP_DAYS,
+        encoding='utf-8',
+        utc=LOG_USE_UTC
+    )
+    fh.setLevel(LOG_LEVEL)
+    fh.setFormatter(fmt)
+
+    # 避免重复添加（脚本重复调用时）
+    if not logger.handlers:
+        logger.addHandler(sh)
+        logger.addHandler(fh)
+    else:
+        # 清理旧的再添加（防止二次导入）
+        logger.handlers.clear()
+        logger.addHandler(sh)
+        logger.addHandler(fh)
+
 
 def run_ipmitool(args: List[str]) -> subprocess.CompletedProcess:
     """
@@ -69,41 +130,45 @@ def run_ipmitool(args: List[str]) -> subprocess.CompletedProcess:
         )
         return result
     except subprocess.TimeoutExpired as e:
-        print(f"[ERROR] ipmitool 命令超时: {e}")
+        logger.error(f"ipmitool 命令超时: {e}")
         return subprocess.CompletedProcess(args, 1, "", "timeout")
     except Exception as e:
-        print(f"[ERROR] 执行 ipmitool 异常: {e}")
+        logger.error(f"执行 ipmitool 异常: {e}")
         return subprocess.CompletedProcess(args, 1, "", str(e))
 
 
 def disable_auto():
     res = run_ipmitool(["raw", "0x30", "0x30", "0x01", "0x00"])
     if res.returncode != 0:
-        print(f"[WARN] 关闭自动模式失败: {res.stderr.strip()}")
+        logger.warning(f"关闭自动模式失败: {res.stderr.strip()}")
 
 
 def enable_auto():
     res = run_ipmitool(["raw", "0x30", "0x30", "0x01", "0x01"])
     if res.returncode != 0:
-        print(f"[WARN] 开启自动模式失败: {res.stderr.strip()}")
+        logger.warning(f"开启自动模式失败: {res.stderr.strip()}")
 
 
 def set_speed(percent: int):
     """
     设置风扇转速百分比（原始命令模式）。
     """
+    original = percent
     if percent < MIN_PERCENT:
         percent = MIN_PERCENT
     if percent > MAX_PERCENT:
         percent = MAX_PERCENT
 
+    if original != percent:
+        logger.debug(f"修正风扇百分比 {original}% -> {percent}% (限制范围 {MIN_PERCENT}-{MAX_PERCENT})")
+
     disable_auto()  # 先关闭自动模式
     hex_byte = f"0x{percent:02x}"
     res = run_ipmitool(["raw", "0x30", "0x30", "0x02", "0xff", hex_byte])
     if res.returncode != 0:
-        print(f"[WARN] 设置速度 {percent}% 失败: {res.stderr.strip()}")
+        logger.warning(f"设置速度 {percent}% 失败: {res.stderr.strip()}")
     else:
-        print(f"[INFO] 已设置风扇速度: {percent}% ({hex_byte})")
+        logger.info(f"已设置风扇速度: {percent}% ({hex_byte})")
 
 
 def parse_sensor_output(output: str) -> List[float]:
@@ -133,7 +198,7 @@ def parse_sensor_output(output: str) -> List[float]:
 def get_temps() -> List[float]:
     res = run_ipmitool(["sensor"])
     if res.returncode != 0:
-        print(f"[ERROR] 读取传感器失败: {res.stderr.strip()}")
+        logger.error(f"读取传感器失败: {res.stderr.strip()}")
         return []
     return parse_sensor_output(res.stdout)
 
@@ -173,14 +238,14 @@ def is_in_time_window(now: datetime, start_str: str, end_str: str) -> bool:
     now_minutes = now.hour * 60 + now.minute
 
     if start_minutes == end_minutes:
-        # 认为整个 24 小时都在区间
+        # 全日均匹配
         return True
 
     if start_minutes < end_minutes:
-        # 不跨午夜
+        # 不跨夜
         return start_minutes <= now_minutes < end_minutes
     else:
-        # 跨午夜：只要 >= start 或 < end
+        # 跨夜：只要 >= start 或 < end
         return now_minutes >= start_minutes or now_minutes < end_minutes
 
 
@@ -193,43 +258,57 @@ def apply_night_limit(speed: int) -> int:
     now = datetime.now()
     if is_in_time_window(now, NIGHT_START, NIGHT_END):
         if speed > NIGHT_MAX_PERCENT:
-            print(f"[INFO] 夜间限速生效: {speed}% -> {NIGHT_MAX_PERCENT}% (区间 {NIGHT_START}-{NIGHT_END})")
+            #print(f"[INFO] 夜间限速生效: {speed}% -> {NIGHT_MAX_PERCENT}% (区间 {NIGHT_START}-{NIGHT_END})")
+            logger.info(
+                f"夜间限速生效: {speed}% -> {NIGHT_MAX_PERCENT}% "
+                f"(区间 {NIGHT_START}-{NIGHT_END})"
+            )
             return NIGHT_MAX_PERCENT
         else:
-            print(f"[DEBUG] 夜间限速已启用，但当前速度 {speed}% 未超过上限 {NIGHT_MAX_PERCENT}%")
+            #print(f"[DEBUG] 夜间限速已启用，但当前速度 {speed}% 未超过上限 {NIGHT_MAX_PERCENT}%")
+            logger.debug(
+                f"夜间限速启用: 当前速度 {speed}% 未超过上限 {NIGHT_MAX_PERCENT}%"
+            )
     return speed
 
 
 def auto_config():
     temps = get_temps()
     if not temps:
-        print("[WARN] 未获取到有效温度数据，保持当前风扇状态。")
+        logger.warning("未获取到有效温度数据，保持当前风扇状态。")
         return
 
     current_max = max(temps)
     base_speed = choose_speed_by_temp(current_max)
-    print(f"[INFO] 当前最高温度: {current_max:.1f}°C -> 策略目标风扇: {base_speed}%")
+    logger.info(f"当前最高温度: {current_max:.1f}°C -> 策略目标风扇: {base_speed}%")
 
     final_speed = apply_night_limit(base_speed)
     set_speed(final_speed)
 
 
 def main():
-    print("[INFO] IPMI 风扇自动调速脚本启动")
-    print(f"[INFO] 轮询间隔: {INTERVAL_SECONDS} 秒, 目标主机: {IPMI_HOST}")
+    setup_logging()
+    logger.info("IPMI 风扇自动调速脚本启动")
+    logger.info(f"轮询间隔: {INTERVAL_SECONDS} 秒, 目标主机: {IPMI_HOST}")
     if NIGHT_LIMIT_ENABLED:
-        print(f"[INFO] 夜间限速启用: {NIGHT_START} - {NIGHT_END}, 最大 {NIGHT_MAX_PERCENT}%")
+        logger.info(f"夜间限速启用: {NIGHT_START} - {NIGHT_END}, 最大 {NIGHT_MAX_PERCENT}%")
     else:
-        print("[INFO] 夜间限速未启用")
+        logger.info("夜间限速未启用")
     scheduler = BlockingScheduler()
-    scheduler.add_job(auto_config, "interval", seconds=INTERVAL_SECONDS, max_instances=1, coalesce=True)
+    scheduler.add_job(
+        auto_config,
+        "interval",
+        seconds=INTERVAL_SECONDS,
+        max_instances=1,
+        coalesce=True
+    )
     try:
         auto_config()  # 立即执行一次
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        # print("\n[INFO] 接收到退出信号，尝试恢复自动控制...")
-        # enable_auto()  # 若希望退出时恢复 BIOS 自动风扇转速控制，请取消此注释
-        print("[INFO] 已退出。")
+        logger.info("接收到退出信号，尝试恢复自动控制（可选）...")
+        # enable_auto()  # 若希望退出时恢复 BIOS 自动，请取消注释
+        logger.info("已退出。")
 
 
 if __name__ == "__main__":
