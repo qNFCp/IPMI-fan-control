@@ -71,6 +71,9 @@ LOG_USE_UTC = False       # True 表示按 UTC 午夜切割
 # 全局 logger
 logger = logging.getLogger("ipmi_fan")
 
+# 上次设置的风扇转速百分比，用于避免重复下发相同指令
+_last_set_speed: int | None = None
+
 
 def setup_logging():
     """
@@ -178,7 +181,7 @@ def parse_sensor_output(output: str) -> List[float]:
     temps = []
     lines = output.strip().splitlines()
     for line in lines:
-        if "Temp" not in line:
+        if "temp" not in line.lower():
             continue
         parts = line.split("|")
         if len(parts) < 2:
@@ -278,12 +281,20 @@ def auto_config():
         logger.warning("未获取到有效温度数据，保持当前风扇状态。")
         return
 
+    global _last_set_speed
+
     current_max = max(temps)
     base_speed = choose_speed_by_temp(current_max)
     logger.info(f"当前最高温度: {current_max:.1f}°C -> 策略目标风扇: {base_speed}%")
 
     final_speed = apply_night_limit(base_speed)
+
+    if final_speed == _last_set_speed:
+        logger.info(f"风扇目标转速 {final_speed}% 未发生变化，跳过下发。")
+        return
+
     set_speed(final_speed)
+    _last_set_speed = final_speed
 
 
 def main():
